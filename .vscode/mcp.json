@@ -1,0 +1,14 @@
+{
+    "servers": {
+        "intune-rw-core": {
+            "type": "stdio",
+            "command": "${workspaceFolder}/.venv/Scripts/intune-mcp-server.exe",
+            "args": [],
+            "env": {
+                "TENANT_ID": "",
+                "CLIENT_ID": "",
+                "CLIENT_SECRET": ""
+            }
+        }
+    }
+}
