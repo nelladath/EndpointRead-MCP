@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Intune & Entra MCP Server — Enterprise Edition (compact tool surface)
+EndpointRead-MCP — Read-Only Intune & Entra MCP Server
 
-Architecture: 34 domain-grouped tools covering 280+ Graph endpoints.
+Architecture: read-only MCP surface for Intune & Entra GET/LIST/SEARCH operations.
 Each tool accepts an `action` parameter so the LLM can invoke any operation
 without the server needing to expose a separate MCP tool per endpoint.
 No external CSV/JSON catalog files are required — everything is self-contained
@@ -10,8 +10,12 @@ in this module, which keeps the server portable for Copilot Studio hosting.
 """
 from __future__ import annotations
 
+import asyncio
+import csv
+import io
 import os
 import sys
+import zipfile
 from typing import Any
 
 if __name__ == "__main__":
@@ -53,7 +57,7 @@ def _transport_security() -> TransportSecuritySettings:
 # Copilot Studio requires JSON responses (not SSE streaming) and a stateless
 # HTTP transport since each call may be routed to a different instance.
 mcp = FastMCP(
-    "intune-mcp-server",
+    "endpointread-mcp-server",
     host="0.0.0.0",
     json_response=True,
     stateless_http=True,
@@ -78,6 +82,136 @@ def _require_confirm(action: str, confirm: bool) -> dict[str, Any] | None:
             "message": f"Action '{action}' is destructive. Resend with confirm=True to proceed.",
         }
     return None
+
+
+# Curated subset of the ~178 Intune report names available via the Graph
+# `/deviceManagement/reports/exportJobs` endpoint. Any valid Graph reportName
+# can be passed to the 'export_report' action even if not listed here.
+_COMMON_INTUNE_REPORTS: dict[str, str] = {
+    "Devices": "All managed devices",
+    "DevicesWithInventory": "Devices with hardware inventory",
+    "DeviceCompliance": "Device compliance status",
+    "DeviceNonCompliance": "Device non-compliance report",
+    "DevicesWithoutCompliancePolicy": "Devices without a compliance policy",
+    "NonCompliantDevicesAndSettings": "Non-compliant devices and settings",
+    "ActiveMalware": "Active malware detections",
+    "Malware": "Detected malware reports",
+    "DefenderAgents": "Microsoft Defender agent status",
+    "UnhealthyDefenderAgents": "Unhealthy Defender endpoints",
+    "FirewallStatus": "MDM firewall status for Windows 10+",
+    "AllAppsList": "All apps list",
+    "AppInvAggregate": "Discovered apps aggregate",
+    "AppInvRawData": "Discovered apps raw data",
+    "AppInstallStatusAggregate": "App install status aggregate",
+    "DeviceInstallStatusByApp": "Device install status by app",
+    "UserInstallStatusAggregateByApp": "User install status by app",
+    "MAMAppProtectionStatus": "MAM app protection status (iOS/Android)",
+    "MAMAppConfigurationStatus": "MAM app configuration status",
+    "AllDeviceCertificates": "All device certificates",
+    "TpmAttestationStatus": "TPM attestation status",
+    "DeviceEncryption": "Device encryption status",
+    "ConfigurationPolicyAggregate": "Configuration policy aggregate",
+    "DeviceConfigurationPolicyStatuses": "Device configuration policy status",
+    "Policies": "All device policies",
+    "PolicyNonComplianceAgg": "Policy non-compliance aggregate",
+    "SettingComplianceAggReport": "Setting compliance aggregate report",
+    "FeatureUpdateDeviceState": "Feature update device state",
+    "FeatureUpdatePolicyStatusSummary": "Feature update policy status summary",
+    "QualityUpdateDeviceStatusByPolicy": "Quality update device status by policy",
+    "QualityUpdatePolicyStatusSummary": "Quality update policy status summary",
+    "WindowsDeviceHealthAttestationReport": "Windows device health attestation report",
+    "EnrollmentActivity": "Device enrollment activity",
+    "DeviceEnrollmentFailures": "Device enrollment failures",
+    "AutopilotV1DeploymentStatus": "Autopilot v1 deployment status",
+    "AutopilotV2DeploymentStatus": "Autopilot v2 deployment status",
+    "EADeviceScoresV2": "Endpoint Analytics device scores",
+    "EAAppPerformance": "Endpoint Analytics app performance",
+    "EAStartupPerfDevicePerformanceV2": "Endpoint Analytics startup performance by device",
+    "WorkFromAnywhereDeviceList": "Work From Anywhere device list",
+    "DeviceRunStatesByScript": "Device run states by script",
+    "DeviceRunStatesByProactiveRemediation": "Device run states by proactive remediation",
+    "Users": "All users",
+    "AllGroupsInMyOrg": "All groups in the organization",
+}
+
+
+async def _run_export_job(
+    c,
+    report_name: str,
+    filter_expr: str = "",
+    select: list[str] | None = None,
+    max_rows: int = 500,
+    timeout_seconds: int = 120,
+) -> dict[str, Any]:
+    """Create an Intune report export job, poll until it completes, then download and parse the CSV.
+
+    Mirrors the export -> poll -> download pattern used by Microsoft's own
+    Intune report export workflow (POST exportJobs, GET exportJobs('id') until
+    status == 'completed', then download the pre-authenticated CSV/zip URL).
+    """
+    body: dict[str, Any] = {
+        "reportName": report_name,
+        "format": "csv",
+        "localizationType": "LocalizedValuesAsAdditionalColumn",
+    }
+    if filter_expr:
+        body["filter"] = filter_expr
+    if select:
+        body["select"] = select
+
+    job = await c.post("/deviceManagement/reports/exportJobs", use_beta=True, json=body)
+    job_id = job.get("id")
+    if not job_id:
+        return {"error": f"Export job for '{report_name}' did not return a job id.", "response": job}
+
+    poll_interval = 4
+    elapsed = 0
+    status_endpoint = f"/deviceManagement/reports/exportJobs('{job_id}')"
+    job_status = job
+    while elapsed < timeout_seconds:
+        await asyncio.sleep(poll_interval)
+        elapsed += poll_interval
+        job_status = await c.get(status_endpoint, use_beta=True)
+        status = str(job_status.get("status", "")).lower()
+        if status == "completed":
+            break
+        if status in {"failed", "cancelled", "error"}:
+            return {"error": f"Export job for '{report_name}' {status}.", "details": job_status}
+    else:
+        return {"error": f"Export job for '{report_name}' timed out after {timeout_seconds}s.", "job_id": job_id}
+
+    download_url = job_status.get("url")
+    if not download_url:
+        return {"error": f"Export job for '{report_name}' completed without a download URL.", "details": job_status}
+
+    client = await c.get_http_client()
+    download_response = await client.get(download_url)
+    if download_response.status_code != 200:
+        return {"error": f"Failed to download report '{report_name}': HTTP {download_response.status_code}"}
+
+    content = download_response.content
+    if content[:2] == b"PK":
+        with zipfile.ZipFile(io.BytesIO(content)) as zf:
+            csv_names = [n for n in zf.namelist() if n.lower().endswith(".csv")]
+            if not csv_names:
+                return {"error": f"No CSV file found in report archive for '{report_name}'."}
+            csv_text = zf.read(csv_names[0]).decode("utf-8-sig")
+    else:
+        csv_text = content.decode("utf-8-sig")
+
+    reader = csv.DictReader(io.StringIO(csv_text))
+    columns = list(reader.fieldnames or [])
+    rows = list(reader)
+    total_rows = len(rows)
+    return {
+        "report_name": report_name,
+        "job_id": job_id,
+        "columns": columns,
+        "row_count": total_rows,
+        "returned_rows": min(total_rows, max_rows),
+        "truncated": total_rows > max_rows,
+        "rows": rows[:max_rows],
+    }
 
 
 # ===========================================================================
@@ -279,6 +413,13 @@ async def manage_intune_devices(
     c = get_graph_client()
     a = action.lower().strip()
 
+    allowed_actions = {'list', 'get', 'search', 'get_noncompliant', 'get_stale', 'get_hardware', 'get_network', 'get_installed_apps', 'get_compliance_states', 'get_log_requests'}
+    if a not in allowed_actions:
+        return {
+            "error": f"Action '{action}' is not available in EndpointRead-MCP (read-only).",
+            "allowed_actions": sorted(allowed_actions),
+        }
+
     if a == "list":
         ep = f"/deviceManagement/managedDevices?$top={min(top, 1000)}"
         if filter_query:
@@ -426,6 +567,13 @@ async def manage_device_encryption(
     c = get_graph_client()
     a = action.lower().strip()
 
+    allowed_actions = {'list_bitlocker_keys', 'get_bitlocker_key', 'get_filevault_key', 'get_encryption_report'}
+    if a not in allowed_actions:
+        return {
+            "error": f"Action '{action}' is not available in EndpointRead-MCP (read-only).",
+            "allowed_actions": sorted(allowed_actions),
+        }
+
     if a == "list_bitlocker_keys":
         r = await c.get("/informationProtection/bitlocker/recoveryKeys")
         return {"count": len(r.get("value", [])), "keys": r.get("value", [])}
@@ -475,6 +623,13 @@ async def manage_intune_apps(
     """
     c = get_graph_client()
     a = action.lower().strip()
+
+    allowed_actions = {'list', 'get', 'search', 'get_install_status', 'list_discovered', 'get_mam_registrations'}
+    if a not in allowed_actions:
+        return {
+            "error": f"Action '{action}' is not available in EndpointRead-MCP (read-only).",
+            "allowed_actions": sorted(allowed_actions),
+        }
 
     if a == "list":
         r = await c.get(f"/deviceAppManagement/mobileApps?$top={top}")
@@ -564,6 +719,13 @@ async def manage_app_config_mam(
     """
     c = get_graph_client()
     a = action.lower().strip()
+
+    allowed_actions = {'list_config_policies', 'get_config_policy', 'list_protection_policies'}
+    if a not in allowed_actions:
+        return {
+            "error": f"Action '{action}' is not available in EndpointRead-MCP (read-only).",
+            "allowed_actions": sorted(allowed_actions),
+        }
     plat_ep = "/deviceAppManagement/iosManagedAppProtections" if platform.lower() == "ios" else "/deviceAppManagement/androidManagedAppProtections"
 
     if a == "list_config_policies":
@@ -632,6 +794,13 @@ async def manage_compliance_policies(
     """
     c = get_graph_client()
     a = action.lower().strip()
+
+    allowed_actions = {'list', 'get', 'get_status', 'list_assignments'}
+    if a not in allowed_actions:
+        return {
+            "error": f"Action '{action}' is not available in EndpointRead-MCP (read-only).",
+            "allowed_actions": sorted(allowed_actions),
+        }
     base = "/deviceManagement/deviceCompliancePolicies"
 
     if a == "list":
@@ -694,6 +863,13 @@ async def manage_configuration_profiles(
     """
     c = get_graph_client()
     a = action.lower().strip()
+
+    allowed_actions = {'list', 'get', 'get_status', 'list_assignments'}
+    if a not in allowed_actions:
+        return {
+            "error": f"Action '{action}' is not available in EndpointRead-MCP (read-only).",
+            "allowed_actions": sorted(allowed_actions),
+        }
     base = "/deviceManagement/deviceConfigurations"
 
     if a == "list":
@@ -754,6 +930,13 @@ async def manage_settings_catalog(
     """
     c = get_graph_client()
     a = action.lower().strip()
+
+    allowed_actions = {'list', 'get'}
+    if a not in allowed_actions:
+        return {
+            "error": f"Action '{action}' is not available in EndpointRead-MCP (read-only).",
+            "allowed_actions": sorted(allowed_actions),
+        }
     base = "/deviceManagement/configurationPolicies"
 
     if a == "list":
@@ -804,6 +987,13 @@ async def manage_admx_policies(
     """
     c = get_graph_client()
     a = action.lower().strip()
+
+    allowed_actions = {'list', 'get'}
+    if a not in allowed_actions:
+        return {
+            "error": f"Action '{action}' is not available in EndpointRead-MCP (read-only).",
+            "allowed_actions": sorted(allowed_actions),
+        }
     base = "/deviceManagement/groupPolicyConfigurations"
 
     if a == "list":
@@ -853,6 +1043,13 @@ async def manage_endpoint_security(
     """
     c = get_graph_client()
     a = action.lower().strip()
+
+    allowed_actions = {'list_policies', 'get_policy', 'get_policy_status', 'list_templates'}
+    if a not in allowed_actions:
+        return {
+            "error": f"Action '{action}' is not available in EndpointRead-MCP (read-only).",
+            "allowed_actions": sorted(allowed_actions),
+        }
 
     if a == "list_policies":
         r = await c.get(f"/deviceManagement/intents?$top={top}", use_beta=True)
@@ -907,6 +1104,13 @@ async def manage_security_baselines(
     c = get_graph_client()
     a = action.lower().strip()
 
+    allowed_actions = {'list_templates', 'list_profiles', 'get_status'}
+    if a not in allowed_actions:
+        return {
+            "error": f"Action '{action}' is not available in EndpointRead-MCP (read-only).",
+            "allowed_actions": sorted(allowed_actions),
+        }
+
     if a == "list_templates":
         r = await c.get(f"/deviceManagement/templates?$top={top}", use_beta=True)
         return {"count": len(r.get("value", [])), "templates": r.get("value", [])}
@@ -950,6 +1154,13 @@ async def manage_windows_update(
     """
     c = get_graph_client()
     a = action.lower().strip()
+
+    allowed_actions = {'list_update_rings', 'get_update_ring', 'list_feature_updates', 'get_feature_update', 'list_quality_updates', 'list_driver_updates'}
+    if a not in allowed_actions:
+        return {
+            "error": f"Action '{action}' is not available in EndpointRead-MCP (read-only).",
+            "allowed_actions": sorted(allowed_actions),
+        }
 
     if a == "list_update_rings":
         r = await c.get(f"/deviceManagement/deviceConfigurations?$filter=isof('microsoft.graph.windowsUpdateForBusinessConfiguration')&$top={top}")
@@ -1021,6 +1232,13 @@ async def manage_intune_scripts(
     c = get_graph_client()
     a = action.lower().strip()
 
+    allowed_actions = {'list', 'get', 'get_status'}
+    if a not in allowed_actions:
+        return {
+            "error": f"Action '{action}' is not available in EndpointRead-MCP (read-only).",
+            "allowed_actions": sorted(allowed_actions),
+        }
+
     ep_map = {
         "powershell": "/deviceManagement/deviceManagementScripts",
         "remediation": "/deviceManagement/deviceHealthScripts",
@@ -1090,6 +1308,13 @@ async def manage_intune_enrollment(
     """
     c = get_graph_client()
     a = action.lower().strip()
+
+    allowed_actions = {'list_restrictions', 'list_vpp_tokens', 'get_vpp_token', 'list_dep_tokens', 'list_android_enterprise', 'get_failures_report', 'list_dep_profiles'}
+    if a not in allowed_actions:
+        return {
+            "error": f"Action '{action}' is not available in EndpointRead-MCP (read-only).",
+            "allowed_actions": sorted(allowed_actions),
+        }
 
     if a == "list_restrictions":
         r = await c.get(f"/deviceManagement/deviceEnrollmentConfigurations?$top={top}")
@@ -1174,6 +1399,13 @@ async def manage_autopilot(
     c = get_graph_client()
     a = action.lower().strip()
 
+    allowed_actions = {'list_devices', 'list_profiles', 'get_profile', 'get_deployment_status', 'list_esp_profiles'}
+    if a not in allowed_actions:
+        return {
+            "error": f"Action '{action}' is not available in EndpointRead-MCP (read-only).",
+            "allowed_actions": sorted(allowed_actions),
+        }
+
     if a == "list_devices":
         r = await c.get(f"/deviceManagement/windowsAutopilotDeviceIdentities?$top={top}", use_beta=True)
         return {"count": len(r.get("value", [])), "devices": r.get("value", [])}
@@ -1254,6 +1486,13 @@ async def manage_filters_tags(
     c = get_graph_client()
     a = action.lower().strip()
 
+    allowed_actions = {'list_filters', 'get_filter', 'list_tags'}
+    if a not in allowed_actions:
+        return {
+            "error": f"Action '{action}' is not available in EndpointRead-MCP (read-only).",
+            "allowed_actions": sorted(allowed_actions),
+        }
+
     if a == "list_filters":
         r = await c.get(f"/deviceManagement/assignmentFilters?$top={top}", use_beta=True)
         return {"count": len(r.get("value", [])), "filters": r.get("value", [])}
@@ -1319,6 +1558,13 @@ async def manage_intune_rbac(
     """
     c = get_graph_client()
     a = action.lower().strip()
+
+    allowed_actions = {'list_roles', 'get_role', 'list_assignments'}
+    if a not in allowed_actions:
+        return {
+            "error": f"Action '{action}' is not available in EndpointRead-MCP (read-only).",
+            "allowed_actions": sorted(allowed_actions),
+        }
 
     if a == "list_resource_operations":
         r = await c.get("/deviceManagement/resourceOperations?$top=999")
@@ -1396,6 +1642,13 @@ async def manage_cloud_pc(
     """
     c = get_graph_client()
     a = action.lower().strip()
+
+    allowed_actions = {'list', 'get', 'get_overview', 'list_snapshots', 'get_audit_events', 'list_provisioning_policies', 'list_gallery_images', 'list_connections'}
+    if a not in allowed_actions:
+        return {
+            "error": f"Action '{action}' is not available in EndpointRead-MCP (read-only).",
+            "allowed_actions": sorted(allowed_actions),
+        }
     ve = "/deviceManagement/virtualEndpoint"
 
     if a == "list":
@@ -1509,6 +1762,13 @@ async def manage_entra_users(
     """
     c = get_graph_client()
     a = action.lower().strip()
+
+    allowed_actions = {'list', 'get', 'search', 'get_devices', 'get_licenses', 'list_available_licenses', 'get_deleted_users', 'get_direct_reports', 'get_member_groups'}
+    if a not in allowed_actions:
+        return {
+            "error": f"Action '{action}' is not available in EndpointRead-MCP (read-only).",
+            "allowed_actions": sorted(allowed_actions),
+        }
 
     if a == "list":
         r = await c.get(f"/users?$top={top}")
@@ -1692,6 +1952,13 @@ async def manage_entra_groups(
     c = get_graph_client()
     a = action.lower().strip()
 
+    allowed_actions = {'list', 'get', 'search', 'get_members', 'get_owners'}
+    if a not in allowed_actions:
+        return {
+            "error": f"Action '{action}' is not available in EndpointRead-MCP (read-only).",
+            "allowed_actions": sorted(allowed_actions),
+        }
+
     if a == "list":
         r = await c.get(f"/groups?$top={top}")
         return {"count": len(r.get("value", [])), "groups": r.get("value", [])}
@@ -1796,6 +2063,13 @@ async def manage_entra_devices(
     c = get_graph_client()
     a = action.lower().strip()
 
+    allowed_actions = {'list', 'get', 'search'}
+    if a not in allowed_actions:
+        return {
+            "error": f"Action '{action}' is not available in EndpointRead-MCP (read-only).",
+            "allowed_actions": sorted(allowed_actions),
+        }
+
     if a == "list":
         r = await c.get(f"/devices?$top={top}")
         return {"count": len(r.get("value", [])), "devices": r.get("value", [])}
@@ -1875,6 +2149,13 @@ async def manage_conditional_access(
     """
     c = get_graph_client()
     a = action.lower().strip()
+
+    allowed_actions = {'list_policies', 'get_policy', 'list_locations'}
+    if a not in allowed_actions:
+        return {
+            "error": f"Action '{action}' is not available in EndpointRead-MCP (read-only).",
+            "allowed_actions": sorted(allowed_actions),
+        }
     ca = "/identity/conditionalAccess/policies"
     nl = "/identity/conditionalAccess/namedLocations"
 
@@ -1958,6 +2239,13 @@ async def manage_identity_protection(
     c = get_graph_client()
     a = action.lower().strip()
 
+    allowed_actions = {'get_auth_methods', 'get_mfa_status', 'get_auth_methods_policy', 'get_sign_in_logs', 'get_directory_audit_logs', 'get_risky_users', 'get_risk_detections'}
+    if a not in allowed_actions:
+        return {
+            "error": f"Action '{action}' is not available in EndpointRead-MCP (read-only).",
+            "allowed_actions": sorted(allowed_actions),
+        }
+
     if a == "get_auth_methods":
         r = await c.get(f"/users/{user_id}/authentication/methods")
         return {"count": len(r.get("value", [])), "methods": r.get("value", [])}
@@ -2035,6 +2323,13 @@ async def manage_app_registrations(
     """
     c = get_graph_client()
     a = action.lower().strip()
+
+    allowed_actions = {'list_registrations', 'get_registration', 'search_registrations', 'get_expiring_credentials', 'list_enterprise_apps', 'get_enterprise_app', 'search_enterprise_apps', 'get_app_permissions'}
+    if a not in allowed_actions:
+        return {
+            "error": f"Action '{action}' is not available in EndpointRead-MCP (read-only).",
+            "allowed_actions": sorted(allowed_actions),
+        }
 
     if a == "list_registrations":
         r = await c.get(f"/applications?$top={top}")
@@ -2130,6 +2425,13 @@ async def manage_tenant_admin(
     c = get_graph_client()
     a = action.lower().strip()
 
+    allowed_actions = {'get_org_info', 'get_domains', 'get_service_health', 'get_service_issues', 'get_message_center', 'get_planned_maintenance', 'list_directory_roles', 'get_role_members', 'get_global_admins', 'get_subscriptions', 'get_security_defaults', 'list_terms_of_use', 'get_cross_tenant_policy'}
+    if a not in allowed_actions:
+        return {
+            "error": f"Action '{action}' is not available in EndpointRead-MCP (read-only).",
+            "allowed_actions": sorted(allowed_actions),
+        }
+
     if a == "get_org_info":
         r = await c.get("/organization")
         return r.get("value", [{}])[0]
@@ -2202,46 +2504,91 @@ async def manage_tenant_admin(
 
 
 # ===========================================================================
-# TOOL 27 — Intune Reports & Analytics
+# TOOL 27 — Intune Reports & Analytics (read-only)
 # ===========================================================================
 @mcp.tool()
 async def manage_intune_reports(
     action: str,
+    report_name: str = "",
+    filter_expr: str = "",
+    select: list[str] | None = None,
     policy_id: str = "",
     app_id: str = "",
     device_id: str = "",
     top: int = 50,
-    body: dict | None = None,
+    max_rows: int = 500,
+    timeout_seconds: int = 120,
 ) -> dict[str, Any]:
     """
-    Intune reports, endpoint analytics and export jobs.
+    Read-only Intune reports, endpoint analytics and report export jobs.
 
     action values:
-      compliance_report        — Device compliance summary
-      config_profile_status    — Deployment status for a config profile (policy_id)
-      compliance_policy_status — Deployment status for a compliance policy (policy_id)
-      app_install_status       — App install summary (app_id)
-      license_usage            — License usage summary
-      hardware_inventory       — Hardware inventory export job
-      malware_report           — Windows protection / malware state
-      malware_on_device        — Detected malware on a device (device_id)
-      device_protection_overview — Device protection status overview
-      endpoint_analytics_score — Endpoint Analytics baseline scores
-      startup_performance      — Device startup performance data
-      app_reliability          — Application reliability/crash scores
-      work_from_anywhere       — Work From Anywhere readiness report
-      app_inventory            — App inventory across all devices
-      certificate_report       — Device certificate status report
-      co_management_report     — Co-management eligibility/status
-      encryption_report        — Device encryption status export
-      enrollment_failures      — Enrollment failures report
+      list_available_reports    — List common Intune report names usable with 'export_report'
+      export_report             — Run any Intune report export job (report_name, filter_expr, select, max_rows)
+      compliance_report         — Device compliance summary
+      config_profile_status     — Deployment status for a config profile (policy_id)
+      compliance_policy_status  — Deployment status for a compliance policy (policy_id)
+      app_install_status        — App install summary (app_id)
+      license_usage             — License usage summary
+      hardware_inventory        — Hardware inventory export (DevicesWithInventory)
+      malware_report            — Windows protection / malware state export
+      malware_on_device         — Detected malware on a device (device_id)
+      device_protection_overview— Device protection status overview
+      endpoint_analytics_score  — Endpoint Analytics baseline scores
+      startup_performance       — Device startup performance data
+      app_reliability           — Application reliability/crash scores
+      work_from_anywhere        — Work From Anywhere readiness export
+      app_inventory             — App inventory export across all devices
+      certificate_report        — Device certificate status export
+      co_management_report      — Co-management eligibility/status
+      encryption_report         — Device encryption status export
+      enrollment_failures       — Enrollment failures export
+
+    Export-job actions (export_report, hardware_inventory, malware_report, work_from_anywhere,
+    app_inventory, certificate_report, encryption_report, enrollment_failures) create an async
+    Graph export job, poll it until completion, download the resulting CSV/zip and return the
+    parsed columns and rows (capped at max_rows).
     """
     c = get_graph_client()
     a = action.lower().strip()
 
+    allowed_actions = {
+        "list_available_reports", "export_report", "compliance_report", "config_profile_status",
+        "compliance_policy_status", "app_install_status", "license_usage", "hardware_inventory",
+        "malware_report", "malware_on_device", "device_protection_overview", "endpoint_analytics_score",
+        "startup_performance", "app_reliability", "work_from_anywhere", "app_inventory",
+        "certificate_report", "co_management_report", "encryption_report", "enrollment_failures",
+    }
+    if a not in allowed_actions:
+        return {
+            "error": f"Action '{action}' is not available in EndpointRead-MCP (read-only).",
+            "allowed_actions": sorted(allowed_actions),
+        }
+
+    if a == "list_available_reports":
+        return {"available_reports": _COMMON_INTUNE_REPORTS}
+
+    export_job_reports = {
+        "export_report": report_name,
+        "hardware_inventory": "DevicesWithInventory",
+        "malware_report": "Malware",
+        "work_from_anywhere": "WorkFromAnywhereDeviceList",
+        "app_inventory": "AppInvAggregate",
+        "certificate_report": "AllDeviceCertificates",
+        "encryption_report": "DeviceEncryption",
+        "enrollment_failures": "DeviceEnrollmentFailures",
+    }
+    if a in export_job_reports:
+        name = export_job_reports[a]
+        if not name:
+            return {"error": "report_name is required for action 'export_report'."}
+        return await _run_export_job(
+            c, name, filter_expr=filter_expr, select=select,
+            max_rows=max_rows, timeout_seconds=timeout_seconds,
+        )
+
     if a == "compliance_report":
-        r = await c.get("/deviceManagement/deviceCompliancePolicyDeviceStateSummary")
-        return r
+        return await c.get("/deviceManagement/deviceCompliancePolicyDeviceStateSummary")
 
     if a == "config_profile_status":
         r = await c.get(f"/deviceManagement/deviceConfigurations/{policy_id}/deviceStatuses?$top={top}")
@@ -2257,14 +2604,6 @@ async def manage_intune_reports(
     if a == "license_usage":
         r = await c.get("/subscribedSkus")
         return {"count": len(r.get("value", [])), "skus": r.get("value", [])}
-
-    if a == "hardware_inventory":
-        return await c.post("/deviceManagement/reports/exportJobs", use_beta=True,
-                            json={"reportName": "DevicesWithInventory", "filter": "", "select": []})
-
-    if a == "malware_report":
-        return await c.post("/deviceManagement/reports/exportJobs", use_beta=True,
-                            json={"reportName": "Malware", "filter": "", "select": []})
 
     if a == "malware_on_device":
         r = await c.get(f"/deviceManagement/managedDevices/{device_id}/windowsProtectionState/detectedMalwareState", use_beta=True)
@@ -2285,198 +2624,115 @@ async def manage_intune_reports(
         r = await c.get(f"/deviceManagement/userExperienceAnalyticsAppHealthApplicationPerformance?$top={top}", use_beta=True)
         return {"count": len(r.get("value", [])), "data": r.get("value", [])}
 
-    if a == "work_from_anywhere":
-        return await c.post("/deviceManagement/reports/exportJobs", use_beta=True,
-                            json={"reportName": "WorkFromAnywhereDeviceList", "filter": "", "select": []})
-
-    if a == "app_inventory":
-        return await c.post("/deviceManagement/reports/exportJobs", use_beta=True,
-                            json={"reportName": "AppInvAggregate", "filter": "", "select": []})
-
-    if a == "certificate_report":
-        return await c.post("/deviceManagement/reports/exportJobs", use_beta=True,
-                            json={"reportName": "AllDeviceCertificates", "filter": "", "select": []})
-
     if a == "co_management_report":
         r = await c.get(f"/deviceManagement/managedDevices?$select=id,deviceName,managementAgent,deviceEnrollmentType&$top={top}")
         return {"count": len(r.get("value", [])), "devices": r.get("value", [])}
-
-    if a == "encryption_report":
-        return await c.post("/deviceManagement/reports/exportJobs", use_beta=True,
-                            json={"reportName": "DeviceEncryption", "filter": "", "select": []})
-
-    if a == "enrollment_failures":
-        return await c.post("/deviceManagement/reports/exportJobs", use_beta=True,
-                            json={"reportName": "DeviceEnrollmentFailures", "filter": "", "select": []})
 
     return {"error": f"Unknown action: {action}"}
 
 
 # ===========================================================================
-# TOOL 28 — Discover Available Operations
+# TOOL 28 — Discover Available Operations (Read-Only Catalog)
 # ===========================================================================
-@mcp.tool()
-async def discover_graph_operations(category: str = "") -> dict[str, Any]:
-    """
-    List all supported Graph operations grouped by tool/domain.
-    Optionally filter by category name (e.g., 'devices', 'users', 'policies').
+def _read_only_catalog() -> dict[str, dict[str, Any]]:
+    return {
+        "manage_admx_policies": {"description": "Read ADMX policy configurations", "actions": ["list", "get"]},
+        "manage_app_config_mam": {"description": "Read app config and MAM protection policies", "actions": ["list_config_policies", "get_config_policy", "list_protection_policies"]},
+        "manage_app_registrations": {"description": "Read app registrations and enterprise apps", "actions": ["list_registrations", "get_registration", "search_registrations", "get_expiring_credentials", "list_enterprise_apps", "get_enterprise_app", "search_enterprise_apps", "get_app_permissions"]},
+        "manage_autopilot": {"description": "Read Autopilot devices and profiles", "actions": ["list_devices", "list_profiles", "get_profile", "get_deployment_status", "list_esp_profiles"]},
+        "manage_cloud_pc": {"description": "Read Cloud PC inventory and status", "actions": ["list", "get", "get_overview", "list_snapshots", "get_audit_events", "list_provisioning_policies", "list_gallery_images", "list_connections"]},
+        "manage_compliance_policies": {"description": "Read compliance policies and status", "actions": ["list", "get", "get_status", "list_assignments"]},
+        "manage_conditional_access": {"description": "Read Conditional Access policies and locations", "actions": ["list_policies", "get_policy", "list_locations"]},
+        "manage_configuration_profiles": {"description": "Read configuration profiles and status", "actions": ["list", "get", "get_status", "list_assignments"]},
+        "manage_device_encryption": {"description": "Read BitLocker/FileVault and encryption report", "actions": ["list_bitlocker_keys", "get_bitlocker_key", "get_filevault_key", "get_encryption_report"]},
+        "manage_endpoint_security": {"description": "Read endpoint security policies", "actions": ["list_policies", "get_policy", "get_policy_status", "list_templates"]},
+        "manage_entra_devices": {"description": "Read Entra devices", "actions": ["list", "get", "search"]},
+        "manage_entra_groups": {"description": "Read Entra groups, members, and owners", "actions": ["list", "get", "search", "get_members", "get_owners"]},
+        "manage_entra_users": {"description": "Read Entra users and related metadata", "actions": ["list", "get", "search", "get_devices", "get_licenses", "list_available_licenses", "get_deleted_users", "get_direct_reports", "get_member_groups"]},
+        "manage_filters_tags": {"description": "Read assignment filters and scope tags", "actions": ["list_filters", "get_filter", "list_tags"]},
+        "manage_identity_protection": {"description": "Read identity protection posture and logs", "actions": ["get_auth_methods", "get_mfa_status", "get_auth_methods_policy", "get_sign_in_logs", "get_directory_audit_logs", "get_risky_users", "get_risk_detections"]},
+        "manage_intune_apps": {"description": "Read Intune apps and install state", "actions": ["list", "get", "search", "get_install_status", "list_discovered", "get_mam_registrations"]},
+        "manage_intune_devices": {"description": "Read managed devices and diagnostics metadata", "actions": ["list", "get", "search", "get_noncompliant", "get_stale", "get_hardware", "get_network", "get_installed_apps", "get_compliance_states", "get_log_requests"]},
+        "manage_intune_enrollment": {"description": "Read enrollment restrictions and token state", "actions": ["list_restrictions", "list_vpp_tokens", "get_vpp_token", "list_dep_tokens", "list_android_enterprise", "get_failures_report", "list_dep_profiles"]},
+        "manage_intune_rbac": {"description": "Read Intune RBAC roles and assignments", "actions": ["list_roles", "get_role", "list_assignments"]},
+        "manage_intune_reports": {"description": "Run read-only Intune reports and report export jobs", "actions": ["list_available_reports", "export_report", "compliance_report", "config_profile_status", "compliance_policy_status", "app_install_status", "license_usage", "hardware_inventory", "malware_report", "malware_on_device", "device_protection_overview", "endpoint_analytics_score", "startup_performance", "app_reliability", "work_from_anywhere", "app_inventory", "certificate_report", "co_management_report", "encryption_report", "enrollment_failures"]},
+        "manage_intune_scripts": {"description": "Read script inventory and execution status", "actions": ["list", "get", "get_status"]},
+        "manage_security_baselines": {"description": "Read security baseline templates and profiles", "actions": ["list_templates", "list_profiles", "get_status"]},
+        "manage_settings_catalog": {"description": "Read settings catalog policies", "actions": ["list", "get"]},
+        "manage_tenant_admin": {"description": "Read tenant metadata and service health", "actions": ["get_org_info", "get_domains", "get_service_health", "get_service_issues", "get_message_center", "get_planned_maintenance", "list_directory_roles", "get_role_members", "get_global_admins", "get_subscriptions", "get_security_defaults", "list_terms_of_use", "get_cross_tenant_policy"]},
+        "manage_windows_update": {"description": "Read Windows Update rings and profiles", "actions": ["list_update_rings", "get_update_ring", "list_feature_updates", "get_feature_update", "list_quality_updates", "list_driver_updates"]},
+    }
 
-    Returns each tool with its name, description and all available action values.
-    """
-    catalog = {
-        "manage_intune_devices": {
-            "description": "Intune managed device lifecycle and device actions",
-            "actions": ["list","get","search","get_noncompliant","get_stale","get_hardware","get_network",
-                        "get_installed_apps","get_compliance_states","get_log_requests","sync","bulk_sync",
-                        "restart","lock","rename","locate","reset_passcode","bypass_activation_lock",
-                        "enable_lost_mode","disable_lost_mode","collect_diagnostics","defender_scan",
-                        "defender_update_signatures","clean_device","delete","wipe","retire"],
-        },
-        "manage_device_encryption": {
-            "description": "BitLocker recovery keys, FileVault and encryption reports",
-            "actions": ["list_bitlocker_keys","get_bitlocker_key","get_filevault_key","get_encryption_report"],
-        },
-        "manage_intune_apps": {
-            "description": "Mobile app CRUD, assignments, install status and discovered apps",
-            "actions": ["list","get","search","create","update","delete","assign","remove_assignment",
-                        "get_install_status","list_discovered","get_mam_registrations"],
-        },
-        "manage_app_config_mam": {
-            "description": "App configuration policies and MAM app protection policies",
-            "actions": ["list_config_policies","get_config_policy","create_config_policy","update_config_policy",
-                        "delete_config_policy","list_protection_policies","create_protection_policy",
-                        "update_protection_policy","delete_protection_policy"],
-        },
-        "manage_compliance_policies": {
-            "description": "Compliance policy CRUD, assignment and deployment status",
-            "actions": ["list","get","create","update","delete","assign","get_status","list_assignments"],
-        },
-        "manage_configuration_profiles": {
-            "description": "Configuration profile CRUD, assignment and deployment status",
-            "actions": ["list","get","create","update","delete","assign","get_status","list_assignments"],
-        },
-        "manage_settings_catalog": {
-            "description": "Settings catalog policy CRUD and assignment",
-            "actions": ["list","get","create","update","delete","assign"],
-        },
-        "manage_admx_policies": {
-            "description": "ADMX / Administrative Templates policy CRUD",
-            "actions": ["list","get","create","delete"],
-        },
-        "manage_endpoint_security": {
-            "description": "Endpoint security policies (AV, Firewall, EDR) and templates",
-            "actions": ["list_policies","get_policy","create_policy","update_policy","delete_policy",
-                        "assign_policy","get_policy_status","list_templates"],
-        },
-        "manage_security_baselines": {
-            "description": "Security baseline templates and deployed profiles",
-            "actions": ["list_templates","list_profiles","get_status"],
-        },
-        "manage_windows_update": {
-            "description": "Windows update rings, feature/quality/driver update profiles",
-            "actions": ["list_update_rings","get_update_ring","create_update_ring","update_update_ring",
-                        "delete_update_ring","list_feature_updates","get_feature_update","create_feature_update",
-                        "list_quality_updates","list_driver_updates"],
-        },
-        "manage_intune_scripts": {
-            "description": "PowerShell scripts, proactive remediations and macOS shell scripts",
-            "actions": ["list","get","create","update","delete","assign","get_status"],
-        },
-        "manage_intune_enrollment": {
-            "description": "Enrollment restrictions, Apple VPP/DEP tokens, Android Enterprise",
-            "actions": ["list_restrictions","create_restriction","update_restriction","delete_restriction",
-                        "assign_restriction","list_vpp_tokens","get_vpp_token","sync_vpp_token",
-                        "list_dep_tokens","sync_dep_token","list_android_enterprise","get_failures_report",
-                        "list_dep_profiles"],
-        },
-        "manage_autopilot": {
-            "description": "Windows Autopilot devices, deployment profiles, ESP",
-            "actions": ["list_devices","list_profiles","get_profile","create_profile","update_profile",
-                        "delete_profile","assign_profile","import_device","delete_device",
-                        "get_deployment_status","list_esp_profiles"],
-        },
-        "manage_filters_tags": {
-            "description": "Assignment filters and scope tags",
-            "actions": ["list_filters","get_filter","create_filter","update_filter","delete_filter",
-                        "list_tags","create_tag","delete_tag"],
-        },
-        "manage_intune_rbac": {
-            "description": "Intune RBAC role definitions and role assignments",
-            "actions": ["list_roles","get_role","create_role","update_role","delete_role",
-                        "list_assignments","create_assignment","delete_assignment"],
-        },
-        "manage_cloud_pc": {
-            "description": "Windows 365 Cloud PC lifecycle, provisioning and connections",
-            "actions": ["list","get","get_overview","restart","reprovision","resize","restore",
-                        "troubleshoot","list_snapshots","get_audit_events","list_provisioning_policies",
-                        "create_provisioning_policy","assign_provisioning_policy",
-                        "list_gallery_images","list_connections"],
-        },
-        "manage_entra_users": {
-            "description": "Entra ID user CRUD, licenses, manager, onboard/offboard, bulk ops",
-            "actions": ["list","get","search","create","update","delete","enable","disable",
-                        "reset_password","revoke_sessions","get_devices","get_licenses",
-                        "assign_license","remove_license","list_available_licenses","get_deleted_users",
-                        "restore_user","assign_manager","remove_manager","get_direct_reports",
-                        "get_member_groups","onboard_user","offboard_user","bulk_create","bulk_assign_license"],
-        },
-        "manage_entra_groups": {
-            "description": "Entra ID group CRUD, membership and ownership",
-            "actions": ["list","get","search","create_security","create_m365","create_dynamic",
-                        "update","delete","get_members","add_member","remove_member",
-                        "get_owners","add_owner","bulk_add_members"],
-        },
-        "manage_entra_devices": {
-            "description": "Entra ID device objects — enable, disable, delete",
-            "actions": ["list","get","search","enable","disable","delete_entra","delete_intune","delete_both"],
-        },
-        "manage_conditional_access": {
-            "description": "Conditional Access policies and named locations",
-            "actions": ["list_policies","get_policy","create_policy","update_policy","delete_policy",
-                        "enable_policy","disable_policy","list_locations","create_location",
-                        "update_location","delete_location"],
-        },
-        "manage_identity_protection": {
-            "description": "Auth methods, MFA status, sign-in logs, risky users, risk detections",
-            "actions": ["get_auth_methods","get_mfa_status","delete_auth_method","get_auth_methods_policy",
-                        "get_sign_in_logs","get_directory_audit_logs","get_risky_users",
-                        "get_risk_detections","dismiss_risky_user","confirm_compromised"],
-        },
-        "manage_app_registrations": {
-            "description": "App registrations and enterprise apps (service principals)",
-            "actions": ["list_registrations","get_registration","search_registrations","delete_registration",
-                        "get_expiring_credentials","list_enterprise_apps","get_enterprise_app",
-                        "search_enterprise_apps","get_app_permissions","enable_enterprise_app",
-                        "disable_enterprise_app"],
-        },
-        "manage_tenant_admin": {
-            "description": "Tenant org info, service health, directory roles, subscriptions, terms of use",
-            "actions": ["get_org_info","get_domains","get_service_health","get_service_issues",
-                        "get_message_center","get_planned_maintenance","list_directory_roles",
-                        "get_role_members","get_global_admins","assign_directory_role",
-                        "remove_directory_role_member","get_subscriptions","get_security_defaults",
-                        "list_terms_of_use","create_terms_of_use","get_cross_tenant_policy"],
-        },
-        "manage_intune_reports": {
-            "description": "Compliance, configuration, app, encryption, analytics and export reports",
-            "actions": ["compliance_report","config_profile_status","compliance_policy_status",
-                        "app_install_status","license_usage","hardware_inventory","malware_report",
-                        "malware_on_device","device_protection_overview","endpoint_analytics_score",
-                        "startup_performance","app_reliability","work_from_anywhere","app_inventory",
-                        "certificate_report","co_management_report","encryption_report","enrollment_failures"],
+
+@mcp.tool()
+async def list_graph_catalog_operations() -> dict[str, Any]:
+    """List all operations from the read-only Graph API catalog, grouped by tool/domain."""
+    catalog = _read_only_catalog()
+    total_actions = sum(len(v["actions"]) for v in catalog.values())
+    return {
+        "tool_count": len(catalog),
+        "total_actions_covered": total_actions,
+        "tools": {
+            name: {
+                "description": info["description"],
+                "action_count": len(info["actions"]),
+                "actions": info["actions"],
+            }
+            for name, info in catalog.items()
         },
     }
 
+
+@mcp.tool()
+async def describe_graph_catalog_operation(tool_name: str, action: str = "") -> dict[str, Any]:
+    """Return metadata for a single catalog tool and optionally validate a specific action."""
+    catalog = _read_only_catalog()
+    entry = catalog.get(tool_name)
+    if not entry:
+        return {"error": f"Tool '{tool_name}' not found in read-only catalog."}
+
+    if action:
+        is_supported = action in entry["actions"]
+        return {
+            "tool": tool_name,
+            "description": entry["description"],
+            "action": action,
+            "supported": is_supported,
+            "allowed_actions": entry["actions"],
+        }
+
+    return {
+        "tool": tool_name,
+        "description": entry["description"],
+        "action_count": len(entry["actions"]),
+        "actions": entry["actions"],
+    }
+
+
+@mcp.tool()
+async def discover_graph_operations(category: str = "") -> dict[str, Any]:
+    """List all supported read-only Graph operations grouped by tool/domain."""
+    catalog = _read_only_catalog()
     if category:
         cat_lower = category.lower()
-        catalog = {k: v for k, v in catalog.items() if cat_lower in k.lower() or cat_lower in v["description"].lower()}
+        catalog = {
+            k: v for k, v in catalog.items()
+            if cat_lower in k.lower() or cat_lower in v["description"].lower()
+        }
 
     total_actions = sum(len(v["actions"]) for v in catalog.values())
     return {
-        "tool_count": len(catalog) + 3,  # +3 for test_connection, get_intune_overview, discover_graph_operations
+        "tool_count": len(catalog),
         "matching_tools": len(catalog),
         "total_actions_covered": total_actions,
-        "tools": {name: {"description": info["description"], "action_count": len(info["actions"]), "actions": info["actions"]} for name, info in catalog.items()},
+        "tools": {
+            name: {
+                "description": info["description"],
+                "action_count": len(info["actions"]),
+                "actions": info["actions"],
+            }
+            for name, info in catalog.items()
+        },
     }
 
 

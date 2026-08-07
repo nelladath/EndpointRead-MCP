@@ -1,8 +1,8 @@
 {
     "servers": {
-        "intune-rw-core": {
+        "endpointread-mcp": {
             "type": "stdio",
-            "command": "${workspaceFolder}/.venv/Scripts/intune-mcp-server.exe",
+            "command": "${workspaceFolder}/.venv/Scripts/endpointread-mcp-server.exe",
             "args": [],
             "env": {
                 "TENANT_ID": "",
