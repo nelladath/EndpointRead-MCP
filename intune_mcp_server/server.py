@@ -2665,51 +2665,6 @@ def _read_only_catalog() -> dict[str, dict[str, Any]]:
 
 
 @mcp.tool()
-async def list_graph_catalog_operations() -> dict[str, Any]:
-    """List all operations from the read-only Graph API catalog, grouped by tool/domain."""
-    catalog = _read_only_catalog()
-    total_actions = sum(len(v["actions"]) for v in catalog.values())
-    return {
-        "tool_count": len(catalog),
-        "total_actions_covered": total_actions,
-        "tools": {
-            name: {
-                "description": info["description"],
-                "action_count": len(info["actions"]),
-                "actions": info["actions"],
-            }
-            for name, info in catalog.items()
-        },
-    }
-
-
-@mcp.tool()
-async def describe_graph_catalog_operation(tool_name: str, action: str = "") -> dict[str, Any]:
-    """Return metadata for a single catalog tool and optionally validate a specific action."""
-    catalog = _read_only_catalog()
-    entry = catalog.get(tool_name)
-    if not entry:
-        return {"error": f"Tool '{tool_name}' not found in read-only catalog."}
-
-    if action:
-        is_supported = action in entry["actions"]
-        return {
-            "tool": tool_name,
-            "description": entry["description"],
-            "action": action,
-            "supported": is_supported,
-            "allowed_actions": entry["actions"],
-        }
-
-    return {
-        "tool": tool_name,
-        "description": entry["description"],
-        "action_count": len(entry["actions"]),
-        "actions": entry["actions"],
-    }
-
-
-@mcp.tool()
 async def discover_graph_operations(category: str = "") -> dict[str, Any]:
     """List all supported read-only Graph operations grouped by tool/domain."""
     catalog = _read_only_catalog()
