@@ -63,4 +63,4 @@ jobs:
         with:
           app-name: 'EndpointReadIntune-MCP'
           slot-name: 'Production'
-          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_9E2299AC307844F19E41038F13EEA6F7 }}
+          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_54DCF22A51F249DBA5FAB20E5C74EAB7 }}
